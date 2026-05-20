@@ -1,0 +1,9 @@
+my_program
+viewer
+/hailo_examples
+_test.py
+*.o
+*.out
+__pycache__/
+*.pyc
+.env
