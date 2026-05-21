@@ -4,7 +4,7 @@ import WebKit
 
 struct ContentView: View {
     private let player = AVPlayer(
-        url: URL(string: "https://customer-spokzxo2ypjk44w3.cloudflarestream.com/0e63f72e7c2678e5669a21479ac0c941/manifest/video.m3u8?protocol=llhls")!
+        url: URL(String://)
     )
 
     var body: some View {
