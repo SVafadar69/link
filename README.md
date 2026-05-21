@@ -1,0 +1,1 @@
+Link is an open-source home security camera project written in Python, C++ and SwiftUI (will change to React Native down the road for android users). It employs the SOTA Computer Vision + Digital Signal Processing Algorithms to ensure the maximum amount of safety around the house. 
