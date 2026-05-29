@@ -8,7 +8,7 @@ using namespace hailort;
 int main() {
     const std::string modelPath = "/usr/share/hailo-models/yolov8s_h8l.hef";
     const std::string bodyFace = "/usr/share/hailo-models/yolov5s_personface_h8l.hef";
-    const std::string imagePath = "/home/sv/Developer/camera/backend/test.jpg";
+    const std::string imagePath = "/home/sv/Developer/camera/backend/download_audio.jpg";
 
 
     auto vdevice_exp = VDevice::create();
@@ -62,7 +62,32 @@ int main() {
     const std::chrono::milliseconds time = std::chrono::milliseconds(1000);
     auto status = configured_model.run(bindings, time);
     if (status == HAILO_SUCCESS) {
-        std::cout << "Inference completed successfully!" << std::endl; 
+        
+        float* results = (float*)output_buffer.data();
+        int max_boxes = output_size / (6 * sizeof(float));
+        for (int i = 0; i < max_boxes; ++i) {
+            float ymin = results[i * 6 + 0];
+            float xmin = results[i * 6 + 1];
+            float ymax = results[i * 6 + 2];
+            float xmas = results[i * 6 + 3];
+            float score = results[i * 6 + 4];
+            int class_id = static_cast<int>(results[i * 6 + 5]);
+
+            if (score > 0.5f) {
+                int x1 = static_cast<int>(xmin * 640);
+                int y1 = static_cast<int>(ymin * 640);
+                int x2 = static_cast<int>(xmas * 640);
+                int y2 = static_cast<int>(ymax * 640);
+
+                cv::rectangle(img, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0, 255, 0), 2);
+                std::string label = "Class " + std::to_string(class_id) + " (" + std::to_string(score).substr(0, 4) + ")";
+                cv::putText(img, label, cv::Point(x1, y1 - 5), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1);
+
+            }
+        }
+        cv::cvtColor(img, img, cv::COLOR_RGB2BGR);
+        cv::imwrite("inference_result.jpg", img); 
+        
     } else {
         std::cerr << "Inference failed with status: " << status << std::endl;
         return -1;
