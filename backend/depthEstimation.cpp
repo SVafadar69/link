@@ -7,6 +7,8 @@ using namespace hailort;
 
 int main() {
     const std::string depthEstimation = "/home/sv/Developer/camera/backend/hailo8l_models/depth_anything_v2_vits.hef";
+    const std::string imagePath = "/home/sv/Developer/camera/backend/download_audio.jpg";
+
 
     auto vdevice_exp = VDevice::create();
     if (!vdevice_exp) {
@@ -41,10 +43,12 @@ int main() {
         return -1;
     }
 
-    cv::resize(img, img, cv::Size(640, 640));
-    cv::cvtColor(img, img, cv::COLOR_BGR2RGB);
+    
 
     auto input_name = infer_model->get_input_names()[0];
+    auto input_shape = infer_model->input(input_name)->shape();
+    cv::resize(img, img, cv::Size(input_shape.width, input_shape.height));
+    cv::cvtColor(img, img, cv::COLOR_BGR2RGB);
     //points to img.data in RAM; 
     bindings.input(input_name)->set_buffer(MemoryView(img.data, img.total()* img.elemSize()));
     
@@ -59,10 +63,22 @@ int main() {
     const std::chrono::milliseconds time = std::chrono::milliseconds(1000);
     auto status = configured_model.run(bindings, time);
     if (status == HAILO_SUCCESS) {
-        
-        float* results = (float*)output_buffer.data();
-        std::cout << "Results" << results << std::endl;
 
+        float* results = (float*)output_buffer.data(); 
+
+        auto output_shape = infer_model->output(output_name)->shape();
+        int out_height = output_shape.height;
+        int out_width = output_shape.width;
+
+        cv::Mat depth_raw(out_height, out_width, CV_32FC1, results);
+        cv::Mat depth_normalized;
+        cv::normalize(depth_raw, depth_normalized, 0, 255, cv::NORM_MINMAX, CV_8UC1);
+
+        cv::Mat depth_colormap; 
+        cv::applyColorMap(depth_normalized, depth_colormap, cv::COLORMAP_INFERNO);
+
+        cv::imwrite("depth_output.jpg", depth_colormap);
+        std::cout << "Depth Estimation Successful" << std::endl;
     }
         
     else {
