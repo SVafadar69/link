@@ -6,9 +6,15 @@
 using namespace hailort; 
 
 int main() {
-    const std::string modelPath = "/usr/share/hailo-models/yolov8s_h8l.hef";
+    const std::string modelPath = "/home/sv/Developer/camera/backend/repvgg_a0_person_reid_2048.hef";
     const std::string bodyFace = "/usr/share/hailo-models/yolov5s_personface_h8l.hef";
     const std::string imagePath = "/home/sv/Developer/camera/backend/download_audio.jpg";
+
+    const std::string personAttributesPath = "/home/sv/Developer/camera/backend/hailo8l_models/person_attr_resnet_v1_18.hef";
+    const std::string faceDet = "/home/sv/Developer/camera/backend/hailo8l_models/lightface_slim.hef";
+
+    const std::string depthEstimation = "/home/sv/Developer/camera/backend/hailo8l_models/depth_anything_v2_vits.hef";
+
 
 
     auto vdevice_exp = VDevice::create();
@@ -18,7 +24,7 @@ int main() {
     }
     auto vdevice = vdevice_exp.release();
 
-    auto infer_model_exp = vdevice->create_infer_model(modelPath);
+    auto infer_model_exp = vdevice->create_infer_model(depthEstimation);
     if (!infer_model_exp) {
         std::cerr << "Error m8" << std::endl;
         return -1; 
@@ -64,31 +70,33 @@ int main() {
     if (status == HAILO_SUCCESS) {
         
         float* results = (float*)output_buffer.data();
-        int max_boxes = output_size / (6 * sizeof(float));
-        for (int i = 0; i < max_boxes; ++i) {
-            float ymin = results[i * 6 + 0];
-            float xmin = results[i * 6 + 1];
-            float ymax = results[i * 6 + 2];
-            float xmas = results[i * 6 + 3];
-            float score = results[i * 6 + 4];
-            int class_id = static_cast<int>(results[i * 6 + 5]);
+        std::cout << "Results" << results << std::endl;
 
-            if (score > 0.5f) {
-                int x1 = static_cast<int>(xmin * 640);
-                int y1 = static_cast<int>(ymin * 640);
-                int x2 = static_cast<int>(xmas * 640);
-                int y2 = static_cast<int>(ymax * 640);
+        // int max_boxes = output_size / (6 * sizeof(float));
+        // for (int i = 0; i < max_boxes; ++i) {
+        //     float ymin = results[i * 6 + 0];
+        //     float xmin = results[i * 6 + 1];
+        //     float ymax = results[i * 6 + 2];
+        //     float xmas = results[i * 6 + 3];
+        //     float score = results[i * 6 + 4];
+        //     int class_id = static_cast<int>(results[i * 6 + 5]);
 
-                cv::rectangle(img, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0, 255, 0), 2);
-                std::string label = "Class " + std::to_string(class_id) + " (" + std::to_string(score).substr(0, 4) + ")";
-                cv::putText(img, label, cv::Point(x1, y1 - 5), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1);
+        //     if (score > 0.5f) {
+        //         int x1 = static_cast<int>(xmin * 640);
+        //         int y1 = static_cast<int>(ymin * 640);
+        //         int x2 = static_cast<int>(xmas * 640);
+        //         int y2 = static_cast<int>(ymax * 640);
+
+        //         cv::rectangle(img, cv::Point(x1, y1), cv::Point(x2, y2), cv::Scalar(0, 255, 0), 2);
+        //         std::string label = "Class " + std::to_string(class_id) + " (" + std::to_string(score).substr(0, 4) + ")";
+        //         cv::putText(img, label, cv::Point(x1, y1 - 5), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1);
 
             }
-        }
-        cv::cvtColor(img, img, cv::COLOR_RGB2BGR);
-        cv::imwrite("inference_result.jpg", img); 
+        //}
+        // cv::cvtColor(img, img, cv::COLOR_RGB2BGR);
+        // cv::imwrite("inference_result.jpg", img); 
         
-    } else {
+    else {
         std::cerr << "Inference failed with status: " << status << std::endl;
         return -1;
     }
