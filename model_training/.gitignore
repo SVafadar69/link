@@ -2,3 +2,5 @@
 .env
 env*
 .env*
+/training_set
+.DS_Store
