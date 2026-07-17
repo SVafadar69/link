@@ -188,7 +188,19 @@ static cv::Mat alignFaceUsingEyes(const cv::Mat &image, cv::Point2f eyeA, cv::Po
         return {};
     }
 
-    const float targetLeftEyeX = 
+    const float targetLeftEyeX = (38.2964f / 112.0f) * outputWidth; 
+    const float targetRightEyeX = (73.5318f / 112.0f) * outputWidth; 
+    const float targetEyeY = (((51.6963f + 51.5014f) * 0.5) / 112.0f) * outputHeight; 
+    const float targetEyeDistance = targetRightEyeX - targetLeftEyeX; 
+    const float scale = targetEyeDistance / currentEyeDistance; 
+    const double angleDegrees = std::atan2(deltaY, deltaX) * 180.0 / CV_PI; 
+    const cv::Point2f targetEyeCenter((targetLeftEyeX + targetRightEyeX) * 0.5f, targetEyeY); 
+    cv::Mat transform = cv::getRotationMatrix2D(sourceEyeCenter, angleDegrees, scale);
+    transforms.at<double>(0, 2) += targetEyeCenter.x - sourceEyeCenter.x; 
+    transforms.at<double>(1, 2) += targetEyeCenter.y - sourceEyeCenter.y; 
+    cv::Mat aligned; 
+    cv::warpAffine(image, aligned, transform, cv::Size(outputWidth, outputHeight), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0)); 
+    return aligned; 
 }
 
 
