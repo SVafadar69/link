@@ -4,8 +4,193 @@
 #include <opencv2/opencv.hpp>
 #include <string>
 #include <algorithm>
+#include <array>
+#include <map>
+#include <numeric> 
+#include <cmat> 
 
 using namespace hailort; 
+
+
+struct OutputTensor {
+    std:: string name, 
+    int height; 
+    int width; 
+    int channels; 
+
+    std::vector<float> data;
+};
+
+struct FaceDetection {
+    cv::Rect2f bbox; 
+    float score; 
+
+    std::array<cv::Point2f, 5>landmarks; 
+};
+
+struct SCRFDBranch {
+    const OutputTensor *scores = nullptr; 
+    const OutputTensor *bboxes = nullptr;
+    const OutputTensor *landmarks = nullptr;
+};
+
+static float tensorAt(const OutputTensor &tensor, int y, int x, int channel) {
+    const size_t index = (static_cast<size_t>(y) * tensor.width + x) * tensor.channels + channel; 
+
+    return tensor.data.at(index);
+}
+
+static float intersectionOverUnion(const cv::Rect2f &a, const cv::Rect2f &b) {
+    const float intersectionLeft = std::max(a.x, b.x);
+    const float intersectionTop = std::max(a.y, b.y); 
+    const float intersectionRight = std::min(a.x + a.width, b.x + b.width);
+    const float intersectionBottom = std::min(a.y + a.height, b.y + b.height);
+    const float intersectionWidth = std::max(0.0f, intersectionRight - intersectionLeft); 
+    const float intersectionHeight = std::max(0.0f, intersectionBottom - intersectionTop);
+    const float intersectionArea = intersectionWidth * intersectionHeight; 
+    const float unionArea = a.area() + b.area() - intersectionArea; 
+
+    if (unionArea <= 0.0f) {
+        return 0.0f;
+    }
+
+    return intersectionArea / unionArea; 
+}
+
+static std::vector<FaceDetection> applyNMS(std::vector<FaceDetection> detections, float iouThreshold) {
+    std::sort(detections.begin(), detections.end(), [](const FaceDetection &a, const FaceDetection &b) {
+        return a.score > b.score; 
+    });
+    std::vector<bool> suppresed(detections.size(), false);
+    std::vector<FaceDetection> kept; 
+
+    for (size_t i = 0; i < detections.size(); ++i) {
+        if (suppresed[i]) {
+            continue;
+        }
+        kept.push_back(detections[i]);
+        for (size_t j = i + 1; j < detections.size(); ++j) {
+            if (suppresed[j]) {
+                continue; 
+            }
+            const float iou = intersectionOverUnion(detections[i].bbox, detections[j].bbox);
+            if (iou > iouThreshold) {
+                suppresed[j] = true; 
+            }
+        }
+    }
+    return kept;
+}
+
+static std::vector<FaceDetection> postProcessSCRFD(const std::vector<OutputTensor> &outputs, int inputWidth, int inputHeight, 
+float scoreThreshold = 0.5f, float nmsThreshold = 0.4f) {
+    std::map<int, SCRFDBranch> branches;
+    for (const auto &tensor : outputs) {
+        if (tensor.width <= 0 || tensor.height <= 0) {
+            continue; 
+        }
+        const int strideX = inputWidth / tensor.width; 
+        const int strideY = inputHeight / tensor.height; 
+        if (strideX != strideY) {
+            std::cerr << "Unexpected non-square stride for " << tensor.name << std::endl; 
+            continue; 
+        }
+        const int stride = strideX; 
+        auto &branch = branches[stride]; 
+
+        switch (tensor.channels) {
+            case 2: 
+                branch.scores = &tensor; 
+                break; 
+            case 8: 
+                branch.bboxes = &tensor; 
+                break 
+            case 20: 
+                branch.landmarks= &tensor; 
+                break; 
+            default: 
+                std::cerr << "Ignoring unexpected SCRFD output " << tensor.name << "with " << tensor.channels << " channels" << std::endl; 
+            break; 
+        }
+    }
+    std::vector<FaceDetection> candidates; 
+
+    for (const auto &[stride, branch] : branches) {
+        if (branch.scores == nullptr || branch.bboxes == nullptr || branch.landmarks == nullptr) {
+            std::cerr << "Incomplete SCRFD branch for stride " << stride << std::endl; 
+            continue;
+        }
+
+        const int gridHeight = branch.scores->height; 
+        const int gridWidth = branch.scores->width; 
+
+        for (int y = 0; y < gridHeight; ++y) {
+            for (int x = 0; x < gridWidth; ++x) {
+                const float centerX = static_cast<float>(x * stride); 
+                const float centerY = static_cast<float>(y * stride); 
+                for (int anchor = 0; anchor < 2; ++anchor) {
+                    const float score = tensorAt(*branch.scores, y, x, anchor); 
+                    if (score < scoreThreshold) {
+                        continue; 
+                    }
+
+                    const int boxBase = anchor * 4; 
+                    const float leftDistance = tensorAt(*branch.boxes, y, x, boxBase + 0); 
+                    const float topDistance = tensorAt(*branch.boxes, y, x, boxBase + 1); 
+                    const float rightDistance = tensorAt(*branch.boxes, y, x, boxBase + 2); 
+                    const float bottomDistance = tensorAt(*branch.boxes, y, x, boxBase + 3); 
+
+                    float x1 = centerX - leftDistance * stride; 
+                    float y1 = centerY - topDistance * stride; 
+                    float x2 = centerX + rightDistance * stride; 
+                    float y2 = centerY + bottomDistance * stride;  
+
+                    x1 = std::clamp(x1, 0.0f, static_cast<float>(inputWidth - 1)); 
+                    y1 = std::clamp(y1, 0.0f, static_cast<float>(inputHeight - 1)); 
+                    x2 = std::clamp(x2, 0.0f, static_cast<float>(inputWidth - 1)); 
+                    y2 = std::clamp(y2, 0.0f, static_cast<float>(inputHeight - 1));
+
+                    if (x2 <= x1 || y2 <= y1) {
+                        continue; 
+                    }
+
+                    FaceDetection detection; 
+                    detection.score = score; 
+
+                    detection.box = cv::Rect2f(x1, y1, x2 - x1, y2 - y1); 
+
+                    const int landmarkBase = anchor * 10; 
+                    for (int landmark = 0; landmark < 5; ++landmark) {
+                        const float offsetX = tensorAt(*branch.landmarks, y, x, landmarkBase + landmark * 2);
+                        const float offsetY = tensorAt(*branch.landmarks, y, x, landmarkBase + landmark * 2 + 1); 
+                        detections.landmarks[landmark] = cv::Point2f(centerX + offsetX * stride, centerY + offsetY * stride); 
+                    }
+                    candidates.push_back(detection);
+                    
+                }
+            }
+        }
+    }
+    return applyNMS(candidates, NMSThreshold);
+}
+
+static cv::Mat alignFaceUsingEyes(const cv::Mat &image, cv::Point2f eyeA, cv::Point2f eyeB, int outputWidth = 112, int outputHeight = 112) {
+    cv::Point2f leftImageEye = eyeA; 
+    cv::Point2f rightImageEye = eyeB; 
+    if (leftImageEye.x > rightImageEye.x) {
+        std::swap(leftImageEye, rightImageEye);
+    }
+    const float deltaX = rightImageEye.x - leftImageEye.x; 
+    const float deltaY = rightImageEye.y - leftImageEye.y; 
+    const float currentEyeDistance = std::sqrt(deltaX * deltaX + deltaY * deltaY); 
+
+    if (currentEyeDistance < 1.0f) {
+        return {};
+    }
+
+    const float targetLeftEyeX = 
+}
+
 
 int main() {
 
@@ -14,6 +199,7 @@ int main() {
     // 20x20 grid - low-resolution predictions for large faces 
 
     // classification tensor, bbox tensor, landmark tensor 
+    // [2, 80, 80] - 2 prediction slots x 1 face score | 2 prediction slots x 4 distances | 2 prediction slots x 5 landmarks x 2 coordinates 
     
 
 
