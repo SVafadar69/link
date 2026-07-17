@@ -13,7 +13,7 @@ constexpr float SCORE_THRESH = 0.5f;
 constexpr float IOU_THRESH = 0.4f; 
 constexpr bool SCORES_ARE_LOGITS = true; 
 
-struct faceDetection {
+struct FaceDetection {
     float score; 
     float x1, y1, x2, y2; 
     std::array<cv::Point2f, 5> landmarks; 
@@ -43,7 +43,7 @@ int stride, float score_thresh, bool scores_are_logits) {
     const int kps_per_anchor = kps_out ? kps_out->features / num_anchors : 0; // expect 10 
 
     for (int y = 0; y < grid_h; ++y) {
-        for (int x = 0; x < grid.w; ++x) {
+        for (int x = 0; x < grid_w; ++x) {
             for (int a = 0; a < num_anchors; ++a) {
                 const int score_idx = (y * grid_w + x) * num_anchors + a; 
                 const float raw_score = score_out.data[score_idx]; 
@@ -293,6 +293,6 @@ int main() {
             const std::string annotated_path = "home/sv/Developer/camera/backend/annotated_output.jpg";
             cv::imwrite(annotated_path, annotated);
             std::cout << "Saved annotated visualization to " << annotated_path << std::endl; 
-            return 0
+            return 0;
 
         }
