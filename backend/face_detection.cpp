@@ -1,316 +1,1153 @@
 #include "hailo/hailort.hpp"
-#include <iostream> 
-#include <vector>
+
 #include <opencv2/opencv.hpp>
-#include <string>
+
 #include <algorithm>
 #include <array>
-#include <map>
-#include <numeric> 
-#include <cmat> 
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <numeric>
+#include <sstream>
+#include <string>
+#include <vector>
 
-using namespace hailort; 
+using namespace hailort;
 
 
-struct OutputTensor {
-    std:: string name, 
-    int height; 
-    int width; 
-    int channels; 
+"""
+score tensor: prob anchor has face
+bbox tensor: left, top, right, bottom distances from the anchor 
+landmark tensor: x/y offsets for facial 5 landmarks 
 
-    std::vector<float> data;
+raw bbox outputs are distances from a known reference (anchor) point 
+anchor_x = 240 
+left bbox raw output = 4.0 -> this is NOT pixels. they are dimensionless multiples of the stride 
+they are dimensionless multiples of the stride -> value of 1.0 = 1.0 x 8 (stride) = 8 pixels. 4.0 x 8 = 32 pixels away. 
+stride = scale of pixel movements - stride of 8 = 8 pixels move in original feature map, 1 moves in stride 
+
+
+raw bbox output of scrfd model = distances measured in units of the feature map stride 
+to decode: anchor_x/y - position (top/bottom, left/right) * model feature map stride (one of 8, 16, 32).
+80x80 -> stride 8 (smaller faces)
+40x40 -> stride 16 (medium faces)
+20x20 -> stride 20
+"""
+
+static configure_hailo_model() {}
+
+struct Detection
+{
+    float x1 = 0.0f;
+    float y1 = 0.0f;
+    float x2 = 0.0f;
+    float y2 = 0.0f;
+    float score = 0.0f;
+
+    // Landmark order:
+    // 0 = left eye
+    // 1 = right eye
+    // 2 = nose
+    // 3 = left mouth corner
+    // 4 = right mouth corner
+    std::array<cv::Point2f, 5> landmarks;
 };
 
-struct FaceDetection {
-    cv::Rect2f bbox; 
-    float score; 
 
-    std::array<cv::Point2f, 5>landmarks; 
+struct ScrfdScale
+{
+    std::string score_output;
+    std::string bbox_output;
+    std::string landmark_output;
+
+    int height;
+    int width;
+    int stride;
 };
 
-struct SCRFDBranch {
-    const OutputTensor *scores = nullptr; 
-    const OutputTensor *bboxes = nullptr;
-    const OutputTensor *landmarks = nullptr;
-};
 
-static float tensorAt(const OutputTensor &tensor, int y, int x, int channel) {
-    const size_t index = (static_cast<size_t>(y) * tensor.width + x) * tensor.channels + channel; 
+static bool ends_with(
+    const std::string &value,
+    const std::string &suffix)
+{
+    if (suffix.size() > value.size()) {
+        return false;
+    }
 
-    return tensor.data.at(index);
+    return std::equal(
+        suffix.rbegin(),
+        suffix.rend(),
+        value.rbegin()
+    );
 }
 
-static float intersectionOverUnion(const cv::Rect2f &a, const cv::Rect2f &b) {
-    const float intersectionLeft = std::max(a.x, b.x);
-    const float intersectionTop = std::max(a.y, b.y); 
-    const float intersectionRight = std::min(a.x + a.width, b.x + b.width);
-    const float intersectionBottom = std::min(a.y + a.height, b.y + b.height);
-    const float intersectionWidth = std::max(0.0f, intersectionRight - intersectionLeft); 
-    const float intersectionHeight = std::max(0.0f, intersectionBottom - intersectionTop);
-    const float intersectionArea = intersectionWidth * intersectionHeight; 
-    const float unionArea = a.area() + b.area() - intersectionArea; 
+// iou between 2 detection s
 
-    if (unionArea <= 0.0f) {
+static float intersection_over_union(
+    const Detection &a,
+    const Detection &b)
+{
+    const float intersection_left =
+        std::max(a.x1, b.x1);
+
+    const float intersection_top =
+        std::max(a.y1, b.y1);
+
+    const float intersection_right =
+        std::min(a.x2, b.x2);
+
+    const float intersection_bottom =
+        std::min(a.y2, b.y2);
+
+    const float intersection_width =
+        std::max(
+            0.0f,
+            intersection_right - intersection_left
+        );
+
+    const float intersection_height =
+        std::max(
+            0.0f,
+            intersection_bottom - intersection_top
+        );
+
+    const float intersection_area =
+        intersection_width * intersection_height;
+
+    const float area_a =
+        std::max(0.0f, a.x2 - a.x1) *
+        std::max(0.0f, a.y2 - a.y1);
+
+    const float area_b =
+        std::max(0.0f, b.x2 - b.x1) *
+        std::max(0.0f, b.y2 - b.y1);
+
+    const float union_area =
+        area_a + area_b - intersection_area;
+
+    if (union_area <= 0.0f) {
         return 0.0f;
     }
 
-    return intersectionArea / unionArea; 
+    return intersection_area / union_area;
 }
 
-static std::vector<FaceDetection> applyNMS(std::vector<FaceDetection> detections, float iouThreshold) {
-    std::sort(detections.begin(), detections.end(), [](const FaceDetection &a, const FaceDetection &b) {
-        return a.score > b.score; 
-    });
-    std::vector<bool> suppresed(detections.size(), false);
-    std::vector<FaceDetection> kept; 
+static std::vector<Detection> non_maximum_suppression(
+    const std::vector<Detection> &detections,
+    float iou_threshold)
+{
+    std::vector<size_t> indices(detections.size());
 
-    for (size_t i = 0; i < detections.size(); ++i) {
-        if (suppresed[i]) {
-            continue;
+    std::iota(
+        indices.begin(),
+        indices.end(),
+        0
+    );
+
+    std::sort(
+        indices.begin(),
+        indices.end(),
+        [&](size_t a, size_t b) {
+            return detections[a].score >
+                   detections[b].score;
         }
-        kept.push_back(detections[i]);
-        for (size_t j = i + 1; j < detections.size(); ++j) {
-            if (suppresed[j]) {
-                continue; 
+    );
+
+    std::vector<Detection> kept_detections;
+
+    for (const size_t candidate_index : indices) {
+        const Detection &candidate =
+            detections[candidate_index];
+
+        bool should_keep = true;
+
+        for (const Detection &kept : kept_detections) {
+            if (intersection_over_union(
+                    candidate,
+                    kept) > iou_threshold) {
+
+                should_keep = false;
+                break;
             }
-            const float iou = intersectionOverUnion(detections[i].bbox, detections[j].bbox);
-            if (iou > iouThreshold) {
-                suppresed[j] = true; 
-            }
+        }
+
+        if (should_keep) {
+            kept_detections.push_back(candidate);
         }
     }
-    return kept;
+
+    return kept_detections;
 }
 
-static std::vector<FaceDetection> postProcessSCRFD(const std::vector<OutputTensor> &outputs, int inputWidth, int inputHeight, 
-float scoreThreshold = 0.5f, float nmsThreshold = 0.4f) {
-    std::map<int, SCRFDBranch> branches;
-    for (const auto &tensor : outputs) {
-        if (tensor.width <= 0 || tensor.height <= 0) {
-            continue; 
-        }
-        const int strideX = inputWidth / tensor.width; 
-        const int strideY = inputHeight / tensor.height; 
-        if (strideX != strideY) {
-            std::cerr << "Unexpected non-square stride for " << tensor.name << std::endl; 
-            continue; 
-        }
-        const int stride = strideX; 
-        auto &branch = branches[stride]; 
+// decoding scrfd scale
+// what is is 
+// the math behind it 
+// information about the actual detector (get in advance)
 
-        switch (tensor.channels) {
-            case 2: 
-                branch.scores = &tensor; 
-                break; 
-            case 8: 
-                branch.bboxes = &tensor; 
-                break 
-            case 20: 
-                branch.landmarks= &tensor; 
-                break; 
-            default: 
-                std::cerr << "Ignoring unexpected SCRFD output " << tensor.name << "with " << tensor.channels << " channels" << std::endl; 
-            break; 
-        }
-    }
-    std::vector<FaceDetection> candidates; 
+static void decode_scrfd_scale(
+    const float *score_data,
+    const float *bbox_data,
+    const float *landmark_data,
+    int feature_height,
+    int feature_width,
+    int stride,
+    int model_width,
+    int model_height,
+    int original_width,
+    int original_height,
+    float score_threshold,
+    std::vector<Detection> &detections)
+{
 
-    for (const auto &[stride, branch] : branches) {
-        if (branch.scores == nullptr || branch.bboxes == nullptr || branch.landmarks == nullptr) {
-            std::cerr << "Incomplete SCRFD branch for stride " << stride << std::endl; 
-            continue;
-        }
+    // scrfd_10g has two prediction anchors per grid cell.
+    constexpr int ANCHORS_PER_CELL = 2;
 
-        const int gridHeight = branch.scores->height; 
-        const int gridWidth = branch.scores->width; 
+    const int score_channels =
+        ANCHORS_PER_CELL;
 
-        for (int y = 0; y < gridHeight; ++y) {
-            for (int x = 0; x < gridWidth; ++x) {
-                const float centerX = static_cast<float>(x * stride); 
-                const float centerY = static_cast<float>(y * stride); 
-                for (int anchor = 0; anchor < 2; ++anchor) {
-                    const float score = tensorAt(*branch.scores, y, x, anchor); 
-                    if (score < scoreThreshold) {
-                        continue; 
-                    }
+    const int bbox_channels =
+        ANCHORS_PER_CELL *
+        BBOX_VALUES_PER_ANCHOR;
 
-                    const int boxBase = anchor * 4; 
-                    const float leftDistance = tensorAt(*branch.boxes, y, x, boxBase + 0); 
-                    const float topDistance = tensorAt(*branch.boxes, y, x, boxBase + 1); 
-                    const float rightDistance = tensorAt(*branch.boxes, y, x, boxBase + 2); 
-                    const float bottomDistance = tensorAt(*branch.boxes, y, x, boxBase + 3); 
+    const int landmark_channels =
+        ANCHORS_PER_CELL *
+        LANDMARK_VALUES_PER_ANCHOR;
 
-                    float x1 = centerX - leftDistance * stride; 
-                    float y1 = centerY - topDistance * stride; 
-                    float x2 = centerX + rightDistance * stride; 
-                    float y2 = centerY + bottomDistance * stride;  
+    const float original_scale_x =
+        static_cast<float>(original_width) /
+        static_cast<float>(model_width);
 
-                    x1 = std::clamp(x1, 0.0f, static_cast<float>(inputWidth - 1)); 
-                    y1 = std::clamp(y1, 0.0f, static_cast<float>(inputHeight - 1)); 
-                    x2 = std::clamp(x2, 0.0f, static_cast<float>(inputWidth - 1)); 
-                    y2 = std::clamp(y2, 0.0f, static_cast<float>(inputHeight - 1));
+    const float original_scale_y =
+        static_cast<float>(original_height) /
+        static_cast<float>(model_height);
 
-                    if (x2 <= x1 || y2 <= y1) {
-                        continue; 
-                    }
+    for (int y = 0; y < feature_height; ++y) {
+        for (int x = 0; x < feature_width; ++x) {
+            const int cell_index =
+                y * feature_width + x;
 
-                    FaceDetection detection; 
-                    detection.score = score; 
+            /*
+             * Hailo's official SCRFD postprocessor places the
+             * anchor centre at:
+             *
+             *     center_x = x * stride
+             *     center_y = y * stride
+             *
+             * It does not add 0.5 to x or y.
+             */
+            const float anchor_center_x =
+                static_cast<float>(x * stride);
 
-                    detection.box = cv::Rect2f(x1, y1, x2 - x1, y2 - y1); 
+            const float anchor_center_y =
+                static_cast<float>(y * stride);
 
-                    const int landmarkBase = anchor * 10; 
-                    for (int landmark = 0; landmark < 5; ++landmark) {
-                        const float offsetX = tensorAt(*branch.landmarks, y, x, landmarkBase + landmark * 2);
-                        const float offsetY = tensorAt(*branch.landmarks, y, x, landmarkBase + landmark * 2 + 1); 
-                        detections.landmarks[landmark] = cv::Point2f(centerX + offsetX * stride, centerY + offsetY * stride); 
-                    }
-                    candidates.push_back(detection);
-                    
+            for (int anchor = 0;
+                 anchor < ANCHORS_PER_CELL;
+                 ++anchor) {
+
+                const int score_offset =
+                    cell_index * score_channels +
+                    anchor;
+
+                /*
+                 * The HEF's classification output is already
+                 * the face score. Do not apply sigmoid again.
+                 */
+                const float score =
+                    score_data[score_offset];
+
+                if (score < score_threshold) {
+                    continue;
                 }
+
+                const int bbox_offset =
+                    cell_index * bbox_channels +
+                    anchor * BBOX_VALUES_PER_ANCHOR;
+
+                // Raw bbox distances from the anchor centre.
+                const float left_distance =
+                    bbox_data[bbox_offset];
+
+                const float top_distance =
+                    bbox_data[bbox_offset + 1];
+
+                const float right_distance =
+                    bbox_data[bbox_offset + 2];
+
+                const float bottom_distance =
+                    bbox_data[bbox_offset + 3];
+
+                float x1_model =
+                    anchor_center_x -
+                    left_distance *
+                        static_cast<float>(stride);
+
+                float y1_model =
+                    anchor_center_y -
+                    top_distance *
+                        static_cast<float>(stride);
+
+                float x2_model =
+                    anchor_center_x +
+                    right_distance *
+                        static_cast<float>(stride);
+
+                float y2_model =
+                    anchor_center_y +
+                    bottom_distance *
+                        static_cast<float>(stride);
+
+                x1_model = std::clamp(
+                    x1_model,
+                    0.0f,
+                    static_cast<float>(model_width - 1)
+                );
+
+                y1_model = std::clamp(
+                    y1_model,
+                    0.0f,
+                    static_cast<float>(model_height - 1)
+                );
+
+                x2_model = std::clamp(
+                    x2_model,
+                    0.0f,
+                    static_cast<float>(model_width - 1)
+                );
+
+                y2_model = std::clamp(
+                    y2_model,
+                    0.0f,
+                    static_cast<float>(model_height - 1)
+                );
+
+                if (x2_model <= x1_model ||
+                    y2_model <= y1_model) {
+
+                    continue;
+                }
+
+                Detection detection;
+
+                // Map the model coordinates back to the original image.
+                detection.x1 =
+                    x1_model * original_scale_x;
+
+                detection.y1 =
+                    y1_model * original_scale_y;
+
+                detection.x2 =
+                    x2_model * original_scale_x;
+
+                detection.y2 =
+                    y2_model * original_scale_y;
+
+                detection.score = score;
+
+                const int landmark_offset =
+                    cell_index * landmark_channels +
+                    anchor * LANDMARK_VALUES_PER_ANCHOR;
+
+                for (int landmark_index = 0;
+                     landmark_index < 5;
+                     ++landmark_index) {
+
+                    const float x_offset =
+                        landmark_data[
+                            landmark_offset +
+                            landmark_index * 2
+                        ];
+
+                    const float y_offset =
+                        landmark_data[
+                            landmark_offset +
+                            landmark_index * 2 + 1
+                        ];
+
+                    /*
+                     * Landmark decoding:
+                     *
+                     * landmark_x = anchor_x + raw_x * stride
+                     * landmark_y = anchor_y + raw_y * stride
+                     */
+                    float landmark_x_model =
+                        anchor_center_x +
+                        x_offset *
+                            static_cast<float>(stride);
+
+                    float landmark_y_model =
+                        anchor_center_y +
+                        y_offset *
+                            static_cast<float>(stride);
+
+                    landmark_x_model = std::clamp(
+                        landmark_x_model,
+                        0.0f,
+                        static_cast<float>(model_width - 1)
+                    );
+
+                    landmark_y_model = std::clamp(
+                        landmark_y_model,
+                        0.0f,
+                        static_cast<float>(model_height - 1)
+                    );
+
+                    detection.landmarks[landmark_index] =
+                        cv::Point2f(
+                            landmark_x_model *
+                                original_scale_x,
+
+                            landmark_y_model *
+                                original_scale_y
+                        );
+                }
+
+                detections.push_back(detection);
             }
         }
     }
-    return applyNMS(candidates, NMSThreshold);
 }
 
-static cv::Mat alignFaceUsingEyes(const cv::Mat &image, cv::Point2f eyeA, cv::Point2f eyeB, int outputWidth = 112, int outputHeight = 112) {
-    cv::Point2f leftImageEye = eyeA; 
-    cv::Point2f rightImageEye = eyeB; 
-    if (leftImageEye.x > rightImageEye.x) {
-        std::swap(leftImageEye, rightImageEye);
-    }
-    const float deltaX = rightImageEye.x - leftImageEye.x; 
-    const float deltaY = rightImageEye.y - leftImageEye.y; 
-    const float currentEyeDistance = std::sqrt(deltaX * deltaX + deltaY * deltaY); 
+// what is std::clamp - why is clamp being used here
 
-    if (currentEyeDistance < 1.0f) {
-        return {};
+static void draw_detection(
+    cv::Mat &image,
+    const Detection &detection,
+    size_t detection_index)
+{
+    const int x1 = std::clamp(
+        static_cast<int>(std::round(detection.x1)),
+        0,
+        image.cols - 1
+    );
+
+    const int y1 = std::clamp(
+        static_cast<int>(std::round(detection.y1)),
+        0,
+        image.rows - 1
+    );
+
+    const int x2 = std::clamp(
+        static_cast<int>(std::round(detection.x2)),
+        0,
+        image.cols - 1
+    );
+
+    const int y2 = std::clamp(
+        static_cast<int>(std::round(detection.y2)),
+        0,
+        image.rows - 1
+    );
+
+    cv::rectangle(
+        image,
+        cv::Point(x1, y1),
+        cv::Point(x2, y2),
+        cv::Scalar(0, 255, 0),
+        2,
+        cv::LINE_AA
+    );
+
+    std::ostringstream label; 
+    label 
+        << "face "
+        << std::fixed 
+        << std::setprecision(2)
+        << detection.score; 
+
+
+    int baseline = 0;
+
+    const cv::Size text_size =
+        cv::getTextSize(
+            label.str(),
+            cv::FONT_HERSHEY_SIMPLEX,
+            0.55,
+            2,
+            &baseline
+        );
+
+    const int label_x =
+        std::clamp(
+            x1,
+            0,
+            std::max(0, image.cols - text_size.width - 8)
+        );
+
+    const int label_y =
+        std::max(
+            0,
+            y1 - text_size.height - 10
+        );
+
+    cv::rectangle(
+        image,
+        cv::Rect(
+            label_x,
+            label_y,
+            text_size.width + 8,
+            text_size.height + 10
+        ),
+        cv::Scalar(0, 255, 0),
+        cv::FILLED
+    );
+
+    cv::putText(
+        image,
+        label.str(),
+        cv::Point(
+            label_x + 4,
+            label_y + text_size.height + 3
+        ),
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.55,
+        cv::Scalar(0, 0, 0),
+        2,
+        cv::LINE_AA
+    );
+
+    // Left eye.
+    cv::circle(
+        image,
+        detection.landmarks[0],
+        4,
+        cv::Scalar(0, 0, 255),
+        cv::FILLED,
+        cv::LINE_AA
+    );
+
+    // Right eye.
+    cv::circle(
+        image,
+        detection.landmarks[1],
+        4,
+        cv::Scalar(255, 0, 0),
+        cv::FILLED,
+        cv::LINE_AA
+    );
+
+    // Nose and mouth corners.
+    for (int landmark_index = 2;
+         landmark_index < 5;
+         ++landmark_index) {
+
+        cv::circle(
+            image,
+            detection.landmarks[landmark_index],
+            3,
+            cv::Scalar(0, 255, 255),
+            cv::FILLED,
+            cv::LINE_AA
+        );
     }
 
-    const float targetLeftEyeX = (38.2964f / 112.0f) * outputWidth; 
-    const float targetRightEyeX = (73.5318f / 112.0f) * outputWidth; 
-    const float targetEyeY = (((51.6963f + 51.5014f) * 0.5) / 112.0f) * outputHeight; 
-    const float targetEyeDistance = targetRightEyeX - targetLeftEyeX; 
-    const float scale = targetEyeDistance / currentEyeDistance; 
-    const double angleDegrees = std::atan2(deltaY, deltaX) * 180.0 / CV_PI; 
-    const cv::Point2f targetEyeCenter((targetLeftEyeX + targetRightEyeX) * 0.5f, targetEyeY); 
-    cv::Mat transform = cv::getRotationMatrix2D(sourceEyeCenter, angleDegrees, scale);
-    transforms.at<double>(0, 2) += targetEyeCenter.x - sourceEyeCenter.x; 
-    transforms.at<double>(1, 2) += targetEyeCenter.y - sourceEyeCenter.y; 
-    cv::Mat aligned; 
-    cv::warpAffine(image, aligned, transform, cv::Size(outputWidth, outputHeight), cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0)); 
-    return aligned; 
+    // Draw the eye line.
+    cv::line(
+        image,
+        detection.landmarks[0],
+        detection.landmarks[1],
+        cv::Scalar(255, 255, 0),
+        2,
+        cv::LINE_AA
+    );
+
+    const cv::Point2f left_eye =
+        detection.landmarks[0];
+
+    const cv::Point2f right_eye =
+        detection.landmarks[1];
+
+    const float eye_angle_degrees =
+        static_cast<float>(
+            std::atan2(
+                right_eye.y - left_eye.y,
+                right_eye.x - left_eye.x
+            ) *
+            180.0 /
+            CV_PI
+        );
+
+    std::cout
+        << "Face " << detection_index
+        << "\n  score: "
+        << detection.score
+        << "\n  bbox: ["
+        << detection.x1 << ", "
+        << detection.y1 << ", "
+        << detection.x2 << ", "
+        << detection.y2 << "]"
+        << "\n  left eye: ("
+        << left_eye.x << ", "
+        << left_eye.y << ")"
+        << "\n  right eye: ("
+        << right_eye.x << ", "
+        << right_eye.y << ")"
+        << "\n  nose: ("
+        << detection.landmarks[2].x << ", "
+        << detection.landmarks[2].y << ")"
+        << "\n  left mouth: ("
+        << detection.landmarks[3].x << ", "
+        << detection.landmarks[3].y << ")"
+        << "\n  right mouth: ("
+        << detection.landmarks[4].x << ", "
+        << detection.landmarks[4].y << ")"
+        << "\n  eye-line angle: "
+        << eye_angle_degrees
+        << " degrees\n";
 }
 
+int main(int argc, char **argv)
+{
 
-int main() {
+    const std::string image_path =
+        argv[1];
 
-    /// 80x80 grid - high resolution predictions for small faces 
-    // 40x40 grid - medium resolution predictions for medium faces 
-    // 20x20 grid - low-resolution predictions for large faces 
+    const std::string output_path =
+        argc >= 3
+            ? argv[2]
+            : "scrfd_result.jpg";
 
-    // classification tensor, bbox tensor, landmark tensor 
-    // [2, 80, 80] - 2 prediction slots x 1 face score | 2 prediction slots x 4 distances | 2 prediction slots x 5 landmarks x 2 coordinates 
+     if (argc < 2) {
+        std::cerr
+            << "Usage: "
+            << argv[0]
+            << " download_audio.jpg [output.jpg]\n";
+
+        return 1;
+    }
+
+    constexpr float SCORE_THRESHOLD = 0.50f;
+    constexpr float NMS_IOU_THRESHOLD = 0.40f;
+
+
+    cv::Mat original_image =
+        cv::imread(image_path);
+
+    cv::Mat annotated_image =
+        original_image.clone();
     
 
+    const std::string hef_path =
+        "/home/sv/Developer/camera/backend/"
+        "hailo8l_models/scrfd_10g.hef";
 
-    const std::string faceDetection = "/home/sv/Developer/camera/backend/hailo8l_models/scrfd_10g.hef";
+    auto vdevice_exp =
+        VDevice::create();
 
-    auto vdevice_exp = VDevice::create();
     if (!vdevice_exp) {
-        std::cerr << "Failed to create VDevice: " << std::endl;
-        return -1;
-    }
-    auto vdevice = vdevice_exp.release();
-    auto hef_exp = Hef::create(faceDetection);
-    if (!hef_exp) {
-        std::cerr << "Failed to create HEF Form" << faceDetection << std::endl; 
-        return hef_exp.status();    
-    }
-    auto hef = hef_exp.release();
+        std::cerr
+            << "Failed to create VDevice. Status: "
+            << vdevice_exp.status()
+            << '\n';
 
-    auto configure_params = vdevice->create_configure_params(hef);
-    auto network_groups_exp = vdevice->configure(hef, configure_params.value());
-    if (!network_groups_exp) {
-        std::cerr << "Failed to configure VDevice" << std::endl;
-        return network_groups_exp.status();
-    }
-    auto network_groups = network_groups_exp.release();
-    auto network_group = network_groups[0];
-
-    auto input_vstreams_params = network_group->make_input_vstream_params(
-        false, 
-        HAILO_FORMAT_TYPE_UINT8,
-        HAILO_DEFAULT_VSTREAM_TIMEOUT_MS,
-        HAILO_DEFAULT_VSTREAM_QUEUE_SIZE,
-        ""
-    );
-    auto output_vstreams_params = network_group->make_output_vstream_params(
-        false, 
-        HAILO_FORMAT_TYPE_FLOAT32,
-        HAILO_DEFAULT_VSTREAM_TIMEOUT_MS,
-        HAILO_DEFAULT_VSTREAM_QUEUE_SIZE,
-        ""
-    );
-  
-
-    
-    auto input_vstreams_exp = VStreamsBuilder::create_input_vstreams(*network_group, input_vstreams_params.value());
-    if (!input_vstreams_exp) return input_vstreams_exp.status();
-    auto input_vstreams = input_vstreams_exp.release();
-    auto output_vstreams_exp = VStreamsBuilder::create_output_vstreams(*network_group, output_vstreams_params.value());
-    if (!output_vstreams_exp) return output_vstreams_exp.status();
-    auto output_vstreams = output_vstreams_exp.release();
-
-    cv::Mat img = cv::imread("/home/sv/Developer/camera/backend/download_audio.jpg");
-    if (img.empty()) {
-        std::cerr << "Failed to load image at " << std::endl;
-        return HAILO_INVALID_ARGUMENT;
-    }
-    auto input_shape = input_vstreams[0].get_info().shape;
-    int height = input_shape.height; 
-    int width = input_shape.width; 
-
-    cv:: Mat resized_img; 
-    cv::cvtColor(img, resized_img, cv::COLOR_BGR2RGB);
-    cv::resize(resized_img, resized_img, cv::Size(width, height));
-
-    std::cout << "Pushing tensor of shape [" << height << ", " << width << ", 3] to the accelerator" << std::endl; 
-
-
-    auto write_status = input_vstreams[0].write(MemoryView(resized_img.data, resized_img.total() * resized_img.elemSize()));
-    if (write_status != HAILO_SUCCESS) {
-        std::cerr << "Failed to write input tensor to the accelerator" << std::endl;
-        return write_status;
+        return 1;
     }
 
-    std::cout << "\n--- Inference Results ---" << std::endl; 
-    for (auto& output_vstream : output_vstreams) {
-        auto output_shape = output_vstream.get_info().shape; 
-        size_t output_size = output_vstream.get_frame_size();
+    auto vdevice =
+        vdevice_exp.release();
 
-        std::vector<float> output_data(output_size / sizeof(float)); 
+    // ---------------------------------------------------------
+    // Create inference model
+    // ---------------------------------------------------------
 
-        auto read_status = output_vstream.read(MemoryView(output_data.data(), output_size));
-        if (read_status != HAILO_SUCCESS) {
-            std::cerr << "Failed reading from output vstream" << std::endl;
-            return read_status;
+    auto infer_model_exp =
+        vdevice->create_infer_model(hef_path);
+
+    if (!infer_model_exp) {
+        std::cerr
+            << "Failed to create InferModel. Status: "
+            << infer_model_exp.status()
+            << '\n';
+
+        return 1;
+    }
+
+    auto infer_model =
+        infer_model_exp.release();
+
+    // ---------------------------------------------------------
+    // Request dequantized FLOAT32 outputs
+    // ---------------------------------------------------------
+
+    for (const std::string &output_name :
+         infer_model->get_output_names()) {
+
+        auto output_exp =
+            infer_model->output(output_name);
+
+        if (!output_exp) {
+            std::cerr
+                << "Failed to access output: "
+                << output_name
+                << '\n';
+
+            return 1;
         }
 
-        std::cout << "\nOutput Layer: " << output_vstream.name() << std::endl;
-        std::cout << "Shape: [" << output_shape.features << ", " << output_shape.height << ", " << output_shape.width << "]" << std::endl;
-        
-        // Print a flattened sample of the raw output
-        int sample_size = std::min(10, static_cast<int>(output_data.size()));
-        std::cout << "Sample values (first " << sample_size << "): ";
-        for (int i = 0; i < sample_size; ++i) {
-            std::cout << output_data[i] << " ";
-        }
-        std::cout << std::endl;
+        /*
+         * In your installed HailoRT version,
+         * set_format_type() returns void.
+         */
+        output_exp->set_format_type(
+            HAILO_FORMAT_TYPE_FLOAT32
+        );
     }
+
+    // ---------------------------------------------------------
+    // Configure model
+    // ---------------------------------------------------------
+
+    auto configured_model_exp =
+        infer_model->configure();
+
+    if (!configured_model_exp) {
+        std::cerr
+            << "Failed to configure model. Status: "
+            << configured_model_exp.status()
+            << '\n';
+
+        return 1;
+    }
+
+    auto configured_model =
+        configured_model_exp.release();
+
+    auto bindings_exp =
+        configured_model.create_bindings();
+
+    if (!bindings_exp) {
+        std::cerr
+            << "Failed to create bindings. Status: "
+            << bindings_exp.status()
+            << '\n';
+
+        return 1;
+    }
+
+    auto bindings =
+        bindings_exp.release();
+
+    // ---------------------------------------------------------
+    // Read input information
+    // ---------------------------------------------------------
+
+    auto model_inputs =
+        infer_model->inputs();
+
+    if (model_inputs.size() != 1) {
+        std::cerr
+            << "Expected one model input, found "
+            << model_inputs.size()
+            << '\n';
+
+        return 1;
+    }
+
+    const auto input_shape =
+        model_inputs[0].shape();
+
+    const int model_height =
+        static_cast<int>(input_shape.height);
+
+    const int model_width =
+        static_cast<int>(input_shape.width);
+
+    const int model_channels =
+        static_cast<int>(input_shape.features);
+
+    std::cout
+        << "Input name: "
+        << model_inputs[0].name()
+        << '\n'
+        << "Input shape: ["
+        << model_height << ", "
+        << model_width << ", "
+        << model_channels << "]\n";
+
+    if (model_channels != 3) {
+        std::cerr
+            << "Expected three input channels, found "
+            << model_channels
+            << '\n';
+
+        return 1;
+    }
+
+    // ---------------------------------------------------------
+    // Preprocess image
+    // ---------------------------------------------------------
+
+    cv::Mat resized_image;
+
+    cv::resize(
+        original_image,
+        resized_image,
+        cv::Size(model_width, model_height)
+    );
+
+    cv::Mat rgb_image;
+
+    cv::cvtColor(
+        resized_image,
+        rgb_image,
+        cv::COLOR_BGR2RGB
+    );
+
+    if (!rgb_image.isContinuous()) {
+        rgb_image = rgb_image.clone();
+    }
+
+    const size_t expected_input_bytes =
+        model_inputs[0].get_frame_size();
+
+    const size_t actual_input_bytes =
+        rgb_image.total() *
+        rgb_image.elemSize();
+
+    if (actual_input_bytes != expected_input_bytes) {
+        std::cerr
+            << "Input byte-size mismatch.\n"
+            << "Model expects: "
+            << expected_input_bytes
+            << " bytes\n"
+            << "Prepared image has: "
+            << actual_input_bytes
+            << " bytes\n";
+
+        return 1;
+    }
+
+    std::vector<uint8_t> input_buffer(
+        expected_input_bytes
+    );
+
+    std::memcpy(
+        input_buffer.data(),
+        rgb_image.data,
+        expected_input_bytes
+    );
+
+    hailo_status input_status =
+        bindings
+            .input(model_inputs[0].name())
+            ->set_buffer(
+                MemoryView(
+                    input_buffer.data(),
+                    input_buffer.size()
+                )
+            );
+
+    if (input_status != HAILO_SUCCESS) {
+        std::cerr
+            << "Failed to bind input buffer. Status: "
+            << input_status
+            << '\n';
+
+        return 1;
+    }
+
+    // ---------------------------------------------------------
+    // Allocate output buffers
+    // ---------------------------------------------------------
+
+    auto model_outputs =
+        infer_model->outputs();
+
+    std::vector<std::vector<float>>
+        output_buffers(model_outputs.size());
+
+    for (size_t i = 0;
+         i < model_outputs.size();
+         ++i) {
+
+        const size_t output_bytes =
+            model_outputs[i].get_frame_size();
+
+        if (output_bytes % sizeof(float) != 0) {
+            std::cerr
+                << "Output is not FLOAT32-compatible: "
+                << model_outputs[i].name()
+                << '\n';
+
+            return 1;
+        }
+
+        output_buffers[i].resize(
+            output_bytes / sizeof(float)
+        );
+
+        hailo_status output_status =
+            bindings
+                .output(model_outputs[i].name())
+                ->set_buffer(
+                    MemoryView(
+                        output_buffers[i].data(),
+                        output_bytes
+                    )
+                );
+
+        if (output_status != HAILO_SUCCESS) {
+            std::cerr
+                << "Failed to bind output: "
+                << model_outputs[i].name()
+                << ". Status: "
+                << output_status
+                << '\n';
+
+            return 1;
+        }
+    }
+
+    // ---------------------------------------------------------
+    // Run inference
+    // ---------------------------------------------------------
+
+    const hailo_status inference_status =
+        configured_model.run(
+            bindings,
+            std::chrono::milliseconds(1000)
+        );
+
+    if (inference_status != HAILO_SUCCESS) {
+        std::cerr
+            << "Inference failed. Status: "
+            << inference_status
+            << '\n';
+
+        return 1;
+    }
+
+    std::cout
+        << "Inference completed successfully.\n";
+
+    // ---------------------------------------------------------
+    // Print outputs and locate tensors
+    // ---------------------------------------------------------
+
+    for (size_t i = 0;
+         i < model_outputs.size();
+         ++i) {
+
+        const auto shape =
+            model_outputs[i].shape();
+
+        std::cout
+            << "Output: "
+            << model_outputs[i].name()
+            << "\nShape: ["
+            << shape.height << ", "
+            << shape.width << ", "
+            << shape.features << "]"
+            << "\nElements: "
+            << output_buffers[i].size()
+            << "\n";
+    }
+
+    auto find_output =
+        [&](const std::string &suffix,
+            int expected_height,
+            int expected_width,
+            int expected_channels) -> const float * {
+
+        for (size_t i = 0;
+             i < model_outputs.size();
+             ++i) {
+
+            const auto shape =
+                model_outputs[i].shape();
+
+            if (!ends_with(
+                    model_outputs[i].name(),
+                    suffix)) {
+
+                continue;
+            }
+
+            if (static_cast<int>(shape.height) !=
+                    expected_height ||
+                static_cast<int>(shape.width) !=
+                    expected_width ||
+                static_cast<int>(shape.features) !=
+                    expected_channels) {
+
+                std::cerr
+                    << "Unexpected shape for "
+                    << model_outputs[i].name()
+                    << ". Expected ["
+                    << expected_height << ", "
+                    << expected_width << ", "
+                    << expected_channels << "], got ["
+                    << shape.height << ", "
+                    << shape.width << ", "
+                    << shape.features << "]\n";
+
+                return nullptr;
+            }
+
+            return output_buffers[i].data();
+        }
+
+        std::cerr
+            << "Could not find output ending with: "
+            << suffix
+            << '\n';
+
+        return nullptr;
+    };
+
+    const std::vector<ScrfdScale> scales = {
+        {
+            "/conv41",
+            "/conv42",
+            "/conv43",
+            80,
+            80,
+            8
+        },
+        {
+            "/conv49",
+            "/conv50",
+            "/conv51",
+            40,
+            40,
+            16
+        },
+        {
+            "/conv56",
+            "/conv57",
+            "/conv58",
+            20,
+            20,
+            32
+        }
+    };
+
+    std::vector<Detection> candidate_detections;
+
+    candidate_detections.reserve(16800);
+
+    // ---------------------------------------------------------
+    // Decode all three scales
+    // ---------------------------------------------------------
+
+    for (const ScrfdScale &scale : scales) {
+        const float *scores =
+            find_output(
+                scale.score_output,
+                scale.height,
+                scale.width,
+                2
+            );
+
+        const float *boxes =
+            find_output(
+                scale.bbox_output,
+                scale.height,
+                scale.width,
+                8
+            );
+
+        const float *landmarks =
+            find_output(
+                scale.landmark_output,
+                scale.height,
+                scale.width,
+                20
+            );
+
+        if (scores == nullptr ||
+            boxes == nullptr ||
+            landmarks == nullptr) {
+
+            std::cerr
+                << "Missing one or more tensors for stride "
+                << scale.stride
+                << '\n';
+
+            return 1;
+        }
+
+        decode_scrfd_scale(
+            scores,
+            boxes,
+            landmarks,
+            scale.height,
+            scale.width,
+            scale.stride,
+            model_width,
+            model_height,
+            original_image.cols,
+            original_image.rows,
+            SCORE_THRESHOLD,
+            candidate_detections
+        );
+    }
+
+    std::cout
+        << "Candidates above threshold: "
+        << candidate_detections.size()
+        << '\n';
+
+    // ---------------------------------------------------------
+    // Non-maximum suppression
+    // ---------------------------------------------------------
+
+    const std::vector<Detection> final_detections =
+        non_maximum_suppression(
+            candidate_detections,
+            NMS_IOU_THRESHOLD
+        );
+
+    std::cout
+        << "Faces after NMS: "
+        << final_detections.size()
+        << '\n';
+
+    // ---------------------------------------------------------
+    // Draw detections
+    // ---------------------------------------------------------
+
+    for (size_t i = 0;
+         i < final_detections.size();
+         ++i) {
+
+        draw_detection(
+            annotated_image,
+            final_detections[i],
+            i
+        );
+    }
+
+    // ---------------------------------------------------------
+    // Save and display result
+    // ---------------------------------------------------------
+
+    if (!cv::imwrite(
+            output_path,
+            annotated_image)) {
+
+        std::cerr
+            << "Failed to save output image: "
+            << output_path
+            << '\n';
+
+        return 1;
+    }
+
+    std::cout
+        << "Saved annotated image to: "
+        << output_path
+        << '\n';
+
+    cv::imshow(
+        "SCRFD detections",
+        annotated_image
+    );
+
+    cv::waitKey(0);
+    cv::destroyAllWindows();
 
     return 0;
-
 }
-
