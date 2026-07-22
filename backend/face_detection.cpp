@@ -17,6 +17,7 @@ using namespace hailort;
 
 //arcface_r50.hef -> 112x112x3 input image as input; rgb; uint8 0-255 
 
+const std::string face_embeddings_model = "arcface_r50.hef";
 
 constexpr float SCORE_THRESHOLD = 0.50f;
 constexpr float NMS_THRESHOLD = 0.40f;
@@ -87,6 +88,21 @@ static HailoModel load_hailo_model(const std::string &hef_path)
         std::move(infer_model),
         configured_exp.release()
     };
+}
+
+static void l2_normalize(std::vector<float> &embedding) {
+    float squared_sum = 0.0f;
+    for (float_value: embedding) {
+        squared_sum += value * value; 
+    }
+
+    const float norm = std::sqrt(squared_sum);
+
+    if (norm > 0.0f) {
+        for (float &value : embedding) {
+            value /= norm;
+        }
+    }
 }
 
 static float iou(const Detection &a, const Detection &b)
