@@ -15,6 +15,9 @@
 
 using namespace hailort;
 
+//arcface_r50.hef -> 112x112x3 input image as input; rgb; uint8 0-255 
+
+
 constexpr float SCORE_THRESHOLD = 0.50f;
 constexpr float NMS_THRESHOLD = 0.40f;
 
@@ -566,7 +569,13 @@ static int run_camera(int camera_index)
         if (!detections.empty()) {
             float alignment_angle = 0.0f;
             cv::Mat aligned_face = face_alignment(frame, detections[0], alignment_angle);
-            std::cout << "aligned face" << aligned_face << std::endl;
+            std::cout << "aligned face" << aligned_face.size() << std::endl;
+            // converting to RGB for arcface_50 inference 
+            cv::cvtColor(aligned_face, rgb_face, cv::COLOR_BGR2RGB);
+            if (!rgb_face.isContinuous()) {
+                rgb_face = rgb_face.clone();
+                std::memcpy(arcface_input_buffer.data(), rgb_face.data(), arcface_input_buffer.size());
+            }
             if (!aligned_face.empty()) {
                 cv::putText(aligned_face, cv::format("Rotation: %.1f deg", alignment_angle),
                 cv::Point2f(10, 25), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
